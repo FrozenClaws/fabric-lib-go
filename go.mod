@@ -1,4 +1,4 @@
-module github.com/hyperledger/fabric-lib-go
+module github.com/FrozenClaws/fabric-lib-go
 
 go 1.23.4
 
