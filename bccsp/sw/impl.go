@@ -19,7 +19,7 @@ import (
 	"hash"
 	"reflect"
 
-	"github.com/herumi/bls"
+	"github.com/herumi/bls-go-binary/bls"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
 	"github.com/pkg/errors"
