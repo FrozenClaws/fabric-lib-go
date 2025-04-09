@@ -19,9 +19,14 @@ import (
 	"hash"
 	"reflect"
 
+	"github.com/herumi/bls"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
 	"github.com/pkg/errors"
+)
+
+const (
+	BLS12_381 = "BLS12_381"
 )
 
 var logger = flogging.MustGetLogger("bccsp_sw")
@@ -30,7 +35,7 @@ var logger = flogging.MustGetLogger("bccsp_sw")
 // on wrappers. It can be customized by providing implementations for the
 // following algorithm-based wrappers: KeyGenerator, KeyDeriver, KeyImporter,
 // Encryptor, Decryptor, Signer, Verifier, Hasher. Each wrapper is bound to a
-// goland type representing either an option or a key.
+// golang type representing either an option or a key.
 type CSP struct {
 	ks bccsp.KeyStore
 
@@ -42,6 +47,122 @@ type CSP struct {
 	Signers       map[reflect.Type]Signer
 	Verifiers     map[reflect.Type]Verifier
 	Hashers       map[reflect.Type]Hasher
+}
+
+// blsKey represents a BLS12-381 key
+type blsKey struct {
+	secretKey  *bls.SecretKey
+	publicKey  *bls.PublicKey
+	exportable bool
+}
+
+// Bytes returns the public key bytes if exportable
+func (k *blsKey) Bytes() ([]byte, error) {
+	if !k.exportable {
+		return nil, errors.New("Key export not allowed")
+	}
+	if k.publicKey != nil {
+		return k.publicKey.Serialize(), nil
+	}
+	return nil, errors.New("No public key available")
+}
+
+// SKI returns the Subject Key Identifier (simplified as first 32 bytes of public key)
+func (k *blsKey) SKI() []byte {
+	if k.publicKey != nil {
+		pubBytes := k.publicKey.Serialize()
+		if len(pubBytes) >= 32 {
+			return pubBytes[:32]
+		}
+	}
+	return nil
+}
+
+// Symmetric returns false for asymmetric keys
+func (k *blsKey) Symmetric() bool {
+	return false
+}
+
+// Private returns true if the key has a private component
+func (k *blsKey) Private() bool {
+	return k.secretKey != nil
+}
+
+// PublicKey returns the public key as a bccsp.Key
+func (k *blsKey) PublicKey() (bccsp.Key, error) {
+	if k.publicKey == nil {
+		return nil, errors.New("No public key available")
+	}
+	return &blsKey{publicKey: k.publicKey, exportable: k.exportable}, nil
+}
+
+// BLS12_381KeyGenerator generates BLS12-381 keys
+type BLS12_381KeyGenerator struct{}
+
+// KeyGen generates a BLS12-381 key
+func (kg *BLS12_381KeyGenerator) KeyGen(opts bccsp.KeyGenOpts) (bccsp.Key, error) {
+	if err := bls.Init(bls.BLS12_381); err != nil {
+		return nil, errors.Wrap(err, "Failed to initialize BLS12-381")
+	}
+	var sec bls.SecretKey
+	sec.SetByCSPRNG()
+	pub := sec.GetPublicKey()
+	return &blsKey{secretKey: &sec, publicKey: pub, exportable: !opts.Ephemeral()}, nil
+}
+
+// BLS12_381KeyImporter imports BLS12-381 keys
+type BLS12_381KeyImporter struct{}
+
+// KeyImport imports a BLS12-381 key from raw bytes
+func (ki *BLS12_381KeyImporter) KeyImport(raw interface{}, opts bccsp.KeyImportOpts) (bccsp.Key, error) {
+	keyBytes, ok := raw.([]byte)
+	if !ok {
+		return nil, errors.New("Invalid raw material, expected byte array")
+	}
+	if err := bls.Init(bls.BLS12_381); err != nil {
+		return nil, errors.Wrap(err, "Failed to initialize BLS12-381")
+	}
+	var sec bls.SecretKey
+	if err := sec.Deserialize(keyBytes); err != nil {
+		return nil, errors.WithMessage(err, "Failed to deserialize BLS12-381 private key")
+	}
+	pub := sec.GetPublicKey()
+	return &blsKey{secretKey: &sec, publicKey: pub, exportable: !opts.Ephemeral()}, nil
+}
+
+// BLS12_381Signer signs messages with BLS12-381 keys
+type BLS12_381Signer struct{}
+
+// Sign signs a digest with a BLS12-381 key
+func (s *BLS12_381Signer) Sign(k bccsp.Key, digest []byte, opts bccsp.SignerOpts) ([]byte, error) {
+	blsK, ok := k.(*blsKey)
+	if !ok || blsK.secretKey == nil {
+		return nil, errors.New("Invalid key, expected BLS12-381 private key")
+	}
+	if len(digest) == 0 {
+		return nil, errors.New("Invalid digest, cannot be empty")
+	}
+	sig := blsK.secretKey.SignByte(digest)
+	return sig.Serialize(), nil
+}
+
+// BLS12_381Verifier verifies BLS12-381 signatures
+type BLS12_381Verifier struct{}
+
+// Verify verifies a BLS12-381 signature
+func (v *BLS12_381Verifier) Verify(k bccsp.Key, signature, digest []byte, opts bccsp.SignerOpts) (bool, error) {
+	blsK, ok := k.(*blsKey)
+	if !ok || blsK.publicKey == nil {
+		return false, errors.New("Invalid key, expected BLS12-381 public key")
+	}
+	if len(signature) == 0 || len(digest) == 0 {
+		return false, errors.New("Invalid signature or digest, cannot be empty")
+	}
+	var sig bls.Sign
+	if err := sig.Deserialize(signature); err != nil {
+		return false, errors.WithMessage(err, "Failed to deserialize BLS12-381 signature")
+	}
+	return sig.VerifyByte(blsK.publicKey, digest), nil
 }
 
 func New(keyStore bccsp.KeyStore) (*CSP, error) {
@@ -59,10 +180,39 @@ func New(keyStore bccsp.KeyStore) (*CSP, error) {
 	keyImporters := make(map[reflect.Type]KeyImporter)
 
 	csp := &CSP{
-		keyStore,
-		keyGenerators, keyDerivers, keyImporters, encryptors,
-		decryptors, signers, verifiers, hashers,
+		ks:            keyStore,
+		KeyGenerators: keyGenerators,
+		KeyDerivers:   keyDerivers,
+		KeyImporters:  keyImporters,
+		Encryptors:    encryptors,
+		Decryptors:    decryptors,
+		Signers:       signers,
+		Verifiers:     verifiers,
+		Hashers:       hashers,
 	}
+
+	// Register BLS12-381 wrappers
+	err := csp.AddWrapper(reflect.TypeOf(&bccsp.BLS12_381KeyGenOpts{}), &BLS12_381KeyGenerator{})
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to add BLS12-381 key generator")
+	}
+	err = csp.AddWrapper(reflect.TypeOf(&bccsp.BLS12_381PrivateKeyImportOpts{}), &BLS12_381KeyImporter{})
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to add BLS12-381 key importer")
+	}
+	err = csp.AddWrapper(reflect.TypeOf(&blsKey{}), &BLS12_381Signer{})
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to add BLS12-381 signer")
+	}
+	err = csp.AddWrapper(reflect.TypeOf(&blsKey{}), &BLS12_381Verifier{})
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to add BLS12-381 verifier")
+	}
+
+	// Add existing wrappers (e.g., ECDSA, RSA) here if needed
+	// Example:
+	// csp.AddWrapper(reflect.TypeOf(&bccsp.ECDSAKeyGenOpts{}), &ECDSAKeyGenerator{})
+	// ...
 
 	return csp, nil
 }
@@ -159,7 +309,7 @@ func (csp *CSP) KeyImport(raw interface{}, opts bccsp.KeyImportOpts) (k bccsp.Ke
 		}
 	}
 
-	return
+	return k, nil
 }
 
 // GetKey returns the key this CSP associates to
@@ -170,7 +320,7 @@ func (csp *CSP) GetKey(ski []byte) (k bccsp.Key, err error) {
 		return nil, errors.Wrapf(err, "Failed getting key for SKI [%v]", ski)
 	}
 
-	return
+	return k, nil
 }
 
 // Hash hashes messages msg using options opts.
@@ -190,10 +340,10 @@ func (csp *CSP) Hash(msg []byte, opts bccsp.HashOpts) (digest []byte, err error)
 		return nil, errors.Wrapf(err, "Failed hashing with opts [%v]", opts)
 	}
 
-	return
+	return digest, nil
 }
 
-// GetHash returns and instance of hash.Hash using options opts.
+// GetHash returns an instance of hash.Hash using options opts.
 // If opts is nil then the default hash function is returned.
 func (csp *CSP) GetHash(opts bccsp.HashOpts) (h hash.Hash, err error) {
 	// Validate arguments
@@ -211,7 +361,7 @@ func (csp *CSP) GetHash(opts bccsp.HashOpts) (h hash.Hash, err error) {
 		return nil, errors.Wrapf(err, "Failed getting hash function with opts [%v]", opts)
 	}
 
-	return
+	return h, nil
 }
 
 // Sign signs digest using key k.
@@ -240,7 +390,7 @@ func (csp *CSP) Sign(k bccsp.Key, digest []byte, opts bccsp.SignerOpts) (signatu
 		return nil, errors.Wrapf(err, "Failed signing with opts [%v]", opts)
 	}
 
-	return
+	return signature, nil
 }
 
 // Verify verifies signature against key k and digest
@@ -263,10 +413,10 @@ func (csp *CSP) Verify(k bccsp.Key, signature, digest []byte, opts bccsp.SignerO
 
 	valid, err = verifier.Verify(k, signature, digest, opts)
 	if err != nil {
-		return false, errors.Wrapf(err, "Failed verifing with opts [%v]", opts)
+		return false, errors.Wrapf(err, "Failed verifying with opts [%v]", opts)
 	}
 
-	return
+	return valid, nil
 }
 
 // Encrypt encrypts plaintext using key k.
@@ -303,7 +453,7 @@ func (csp *CSP) Decrypt(k bccsp.Key, ciphertext []byte, opts bccsp.DecrypterOpts
 		return nil, errors.Wrapf(err, "Failed decrypting with opts [%v]", opts)
 	}
 
-	return
+	return plaintext, nil
 }
 
 // AddWrapper binds the passed type to the passed wrapper.
@@ -334,7 +484,7 @@ func (csp *CSP) AddWrapper(t reflect.Type, w interface{}) error {
 	case Hasher:
 		csp.Hashers[t] = dt
 	default:
-		return errors.Errorf("wrapper type not valid, must be on of: KeyGenerator, KeyDeriver, KeyImporter, Encryptor, Decryptor, Signer, Verifier, Hasher")
+		return errors.Errorf("wrapper type not valid, must be one of: KeyGenerator, KeyDeriver, KeyImporter, Encryptor, Decryptor, Signer, Verifier, Hasher")
 	}
 	return nil
 }
